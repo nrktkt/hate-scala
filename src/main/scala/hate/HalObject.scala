@@ -1,0 +1,3 @@
+package hate
+
+trait HalObject
