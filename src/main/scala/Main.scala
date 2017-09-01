@@ -1,46 +1,101 @@
-import akka.http.scaladsl.Http
-import akka.http.scaladsl.model.Uri.{Authority, Path}
-import akka.http.scaladsl.model.{HttpRequest, Uri}
-import hate.{HalEmbeddable, HalLink, HalResource}
+import akka.http.scaladsl.model.Uri
+import hate.HalExtractable.ContextualReader
+import hate.HalLink._
+import hate.HalResource._
+import hate.{HalEmbeddable, HalExtractable, HalResource, UriString}
 import org.json4s.JsonAST.JObject
-import org.json4s._
 import org.json4s.JsonDSL._
+import org.json4s._
 import org.json4s.jackson.JsonMethods._
-import HalResource._
-import HalLink._
 
 object M extends App{
-  case class Sample(str: String, i: Int)
 
-  case class Order(id: Int, total: Double, currency: String, status: String, basketId: Int, customerId: Int)
+  case class PaymentAccount(`type`: String, info: String)
+  case class Order(id: Int, total: Double, currency: String, status: String, paymentAccount: PaymentAccount, basketId: Int, customerId: Int)
 
-  implicit val orderWriter = new Writer[Order] {
-    def write(obj: Order) =
-      ("id" -> obj.id) ~
-        ("total" -> obj.total) ~
+  implicit val orderWriter: Writer[Order] = (obj: Order) =>
+      (("id" -> obj.id) ~
+        ("total" -> obj.total)) (org.json4s.JsonDSL.double2jvalue) ~
         ("currency" -> obj.currency) ~
         ("status" -> obj.status)
+
+
+  implicit val accountFormat = new JsonFormat[PaymentAccount] {
+    def read(value: JValue) = {
+      for {
+        JObject(obj) <- value
+        JField("type", JString(typ)) <- obj
+        JField("info", JString(info)) <- obj
+      } yield PaymentAccount(typ, info)
+    }.head
+
+    def write(obj: PaymentAccount) =
+      ("type", obj.`type`) ~ ("info", obj.info)
   }
 
-  implicit val orderEmbeddable = new HalEmbeddable[Order] {
-    def toHalResource(obj: Order) = HalResource(
+  val orderReader: ContextualReader[Order] = (links, embeds) => { (json: JValue) =>
+      val basketLink = """\/baskets\/(\d+)""".r
+      val customerLink = """\/customers\/(\d+)""".r
+      val f = for {
+        JObject(order) <- json
+        JField("id", JInt(id)) <- order
+        JField("total", JDouble(total)) <- order
+        JField("currency", JString(currency)) <- order
+        JField("status", JString(status)) <- order
+        ("basket", Right(HalHref(Right(UriString(basketLink(basketId)))))) <- links
+        ("customer", Right(HalHref(Right(UriString(customerLink(customerId)))))) <- links
+        ("account", Right(HalResource(account: PaymentAccount, _, _))) <- embeds
+      }
+        yield Order(id.toInt, total, currency, status, account, basketId.toInt, customerId.toInt)
+      f.head
+  }
+
+  implicit val accountEmbeddable = HalEmbeddable[PaymentAccount]
+
+  implicit def orderEmbeddable = HalEmbeddable( (obj: Order) =>
+    HalResource(
       obj,
+      embedded = Map("account" -> obj.paymentAccount),
       links = Map(
-        "self" -> HalLink(Uri(s"/orders/${obj.id}")),
-        "basket" -> HalLink(Uri(s"/baskets/${obj.basketId}")),
-        "customer" -> HalLink(Uri(s"/customers/${obj.customerId}"))
-      ))
+        "self" -> Uri(s"/orders/${obj.id}"),
+        "basket" -> Uri(s"/baskets/${obj.basketId}"),
+        "customer" -> Uri(s"/customers/${obj.customerId}")
+      )
+    )
+  )
+
+  val order = Order(123, 30, "USD", "shipped", PaymentAccount("PayPal", "jim@gmail.com"), 97212, 7809)
+  val orderHal: HalResource[Order] = orderEmbeddable.toHalResource(order)
+  val json: JValue = asJValue(orderHal)
+  println(pretty(render(json)))
+
+  implicit val accountExtractable = new HalExtractable[PaymentAccount] {
+    def writer = accountFormat
+    def reader = (_, _) => accountFormat
+    def extractors = Map.empty
   }
 
-  val order = Order(123, 30, "USD", "shipped", 97212, 7809)
-  val orderHal = orderEmbeddable.toHalResource(order)
-  println(pretty(render(asJValue(orderHal))))
-
-  implicit val ser = new Writer[Sample] {
-    def write(obj: Sample): JValue = obj.str -> obj.i
+  implicit val orderExtractable = new HalExtractable[Order] {
+    val writer = orderWriter
+    val reader = orderReader
+    def extractors: Map[String, HalExtractable[_]] = Map("account" -> accountExtractable)
   }
-  val hal = HalResource(Sample("hi", 5)).copy(embedded = Map("other" -> Right(HalResource(Sample("lo", 4)))))
-  println(pretty(render(hal.toJson)))
+
+  val parsed: HalResource[Order] = HalResource.fromJson[Order](json)
+
+  println(parsed)
+
+
+  val orders: Seq[Order] = Seq(order, Order(456, 3.50, "USD", "processing", PaymentAccount("Bank", "01234567890123"), 97213, 12369))
+  val hal = HalResource(
+    links = Map(
+      "self" -> Uri("/orders"),
+      "next" -> Uri("/orders?page=2")
+    ),
+    embedded = Map("orders" -> orders)
+  )
+
+  println(pretty(render(asJValue(hal))))
 }
 
 /*

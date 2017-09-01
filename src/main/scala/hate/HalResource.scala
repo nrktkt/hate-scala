@@ -1,13 +1,14 @@
 package hate
 
-import org.json4s._
+import hate.HalResource._
 import org.json4s.JsonDSL._
+import org.json4s._
 
 case class HalResource[T](
-                                    value: T,
-                                    links: Map[String, Either[Seq[HalLink], HalLink]] = Map.empty,
-                                    embedded: Map[String, Either[Seq[HalResource[_]], HalResource[_]]] = Map.empty
-                                  )(implicit valWriter: Writer[T]) extends HalObject {
+                           value: T,
+                           links: HalLinks = Map.empty,
+                           embedded: HalEmbeds = Map.empty
+                         )(implicit valWriter: Writer[T]) extends HalObject {
 
   def withLink(key: String, link: HalLink): HalResource[T] = links.get(key) match {
     case None => copy(links = links + (key -> Right(link)))
@@ -53,9 +54,42 @@ case class HalResource[T](
 
 object HalResource {
 
-  implicit def writer[T](implicit valWriter: Writer[T]) = new Writer[HalResource[T]] {
-    def write(obj: HalResource[T]): JValue = obj.toJson
+  def apply(links: HalLinks, embedded: HalEmbeds) = HalResource[Unit](
+    (),
+    links,
+    embedded
+  )((obj: Unit) => JObject())
+
+  type HalLinks = Map[String, Either[Seq[HalLink], HalLink]]
+  type HalEmbeds = Map[String, Either[Seq[HalResource[_]], HalResource[_]]]
+
+  def fromJson[T](json: JValue)(implicit extractor: HalExtractable[T]): HalResource[T] = {
+
+    val links: Map[String, Either[Seq[HalLink], HalLink]] = json \ "_links" match {
+      case JObject(linkSet) => linkSet.toMap.mapValues {
+        case JArray(ls) => Left(ls.map(HalLink.fromJson))
+        case obj => Right(HalLink.fromJson(obj))
+      }
+      case _ => Map.empty
+    }
+
+    val embedded: Map[String, Either[Seq[HalResource[_]], HalResource[_]]] = json \ "_embedded" match {
+      case JObject(embeddedSet) => embeddedSet.map {
+        case (key, JArray(embeds)) if extractor.extractors.contains(key) =>
+          (key, Left(embeds.map(js => HalResource.fromJson(js)(extractor.extractors(key)))))
+        case (key, obj) if extractor.extractors.contains(key) =>
+          (key, Right(HalResource.fromJson(obj)(extractor.extractors(key))))
+        case _ => (null, null)
+      }.toMap
+      case _ => Map.empty
+    }
+
+    val value = extractor.reader(links, embedded).read(json)
+
+    HalResource(value, links, embedded)(extractor.writer)
   }
+
+  implicit def writer[T]: Writer[HalResource[T]] = (obj: HalResource[T]) => obj.toJson
 
   implicit def resourceReserved[A <: HalObject](o: A): Either[Seq[A], A] = Right(o)
   implicit def resourceReserved[A <: HalObject](os: Seq[A]): Either[Seq[A], A] = Left(os)
